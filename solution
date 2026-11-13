@@ -1,0 +1,255 @@
+// =====================================================================
+//  SOLUTION HEDERA : démo des 4 modules solidaires sur le testnet Hedera
+//  (compensation, troc programmé, achat groupé, préfinancement)
+//  ENTIÈREMENT FICTIF : acteurs, montants et jetons sans valeur.
+//  Testnet uniquement. À coller dans le Playground du portail Hedera.
+// =====================================================================
+const {
+  AccountId, PrivateKey, Client, Hbar, KeyList, NftId, Status,
+  AccountCreateTransaction, TopicCreateTransaction, TopicMessageSubmitTransaction,
+  TokenCreateTransaction, TokenType, TokenSupplyType, TokenMintTransaction,
+  TransferTransaction, ScheduleCreateTransaction, ScheduleSignTransaction, ScheduleInfoQuery,
+} = require("@hiero-ledger/sdk");
+const crypto = require("crypto");
+
+const HS = "https://hashscan.io/testnet";
+const UCM = 10; // 1 décimale : 1 UCM = 10 unités de base
+const u = (x) => Math.round(x * UCM);
+
+async function main() {
+  let client;
+  try {
+    // ---------- 0. Connexion (compte du portail) ----------
+    const MY_ACCOUNT_ID = AccountId.fromString(process.env.HEDERA_ACCOUNT_ID);
+    let MY_PRIVATE_KEY;
+    try { MY_PRIVATE_KEY = PrivateKey.fromStringECDSA(process.env.HEDERA_PRIVATE_KEY); }
+    catch { MY_PRIVATE_KEY = PrivateKey.fromStringDer(process.env.HEDERA_PRIVATE_KEY); }
+    client = Client.forTestnet();
+    client.setOperator(MY_ACCOUNT_ID, MY_PRIVATE_KEY);
+
+    // Exécute une transaction signée par les clés données, renvoie le reçu.
+    async function run(tx, ...keys) {
+      tx.freezeWith(client);
+      for (const k of keys) await tx.sign(k);
+      const resp = await tx.execute(client);
+      const rcpt = await resp.getReceipt(client);
+      return { rcpt, txId: resp.transactionId.toString() };
+    }
+    const txLink = (id) => {
+      const [acc, ts] = id.split("@");
+      return `${HS}/transaction/${acc}-${ts.replace(".", "-")}`;
+    };
+
+    console.log("=== SOLUTION HEDERA : démo fictive sur testnet Hedera ===\n");
+
+    // ---------- 1. INSCRIPTION : acteurs + Conseil 2 sur 3 ----------
+    console.log("1) Inscription des acteurs (comptes Hedera)");
+    const noms = ["Ivoire Broyage (CI)", "Coop Ivoire Cacao (CI)", "Phosmar (MA)", "Delta Chem (NG)", "Fonds panafricain"];
+    const A = {};
+    for (const nom of noms) {
+      const key = PrivateKey.generateECDSA();
+      const { rcpt } = await run(
+        new AccountCreateTransaction()
+          .setKeyWithoutAlias(key.publicKey)
+          .setInitialBalance(new Hbar(2))
+          .setMaxAutomaticTokenAssociations(10) // reçoit les jetons sans étape d'association
+          .setAccountMemo(`Solution Hedera fictive : ${nom}`)
+      );
+      A[nom] = { id: rcpt.accountId, key };
+      console.log(`   ${nom.padEnd(24)} ${rcpt.accountId}  ${HS}/account/${rcpt.accountId}`);
+    }
+    const IV = A[noms[0]], COOP = A[noms[1]], MA = A[noms[2]], NG = A[noms[3]], FONDS = A[noms[4]];
+
+    const conseil = [PrivateKey.generateECDSA(), PrivateKey.generateECDSA(), PrivateKey.generateECDSA()];
+    const cleConseil = new KeyList(conseil.map((k) => k.publicKey), 2); // 2 signatures sur 3
+    console.log("   Conseil : clé à seuil 2 sur 3 (aucun membre seul ne peut émettre)\n");
+
+    // ---------- 2. JOURNAL HCS ----------
+    const { rcpt: rT } = await run(new TopicCreateTransaction().setTopicMemo("Solution Hedera : journal fictif"));
+    const topicId = rT.topicId;
+    console.log(`2) Journal HCS créé : ${topicId}  ${HS}/topic/${topicId}\n`);
+    async function journal(obj) {
+      const { rcpt } = await run(
+        new TopicMessageSubmitTransaction().setTopicId(topicId).setMessage(JSON.stringify(obj))
+      );
+      return rcpt.topicSequenceNumber.toString();
+    }
+
+    // ---------- 3. JETONS HTS ----------
+    console.log("3) Jetons HTS");
+    const { rcpt: rU } = await run(
+      new TokenCreateTransaction()
+        .setTokenName("Unite de Compte Mutualisee (demo, sans valeur)")
+        .setTokenSymbol("UCM")
+        .setTokenType(TokenType.FungibleCommon)
+        .setDecimals(1)
+        .setInitialSupply(0)
+        .setTreasuryAccountId(MY_ACCOUNT_ID)
+        .setSupplyKey(cleConseil)
+    );
+    const ucmId = rU.tokenId;
+    console.log(`   UCM (fongible) : ${ucmId}  ${HS}/token/${ucmId}`);
+
+    // Gouvernance : une seule signature du Conseil -> refus attendu
+    try {
+      await run(new TokenMintTransaction().setTokenId(ucmId).setAmount(u(1000)), conseil[0]);
+      console.log("   !! émission avec 1 signature acceptée (inattendu)");
+    } catch (e) {
+      console.log(`   Émission avec 1 seule signature : REFUSÉE (${e.status || e.message})`);
+    }
+    await run(new TokenMintTransaction().setTokenId(ucmId).setAmount(u(550)), conseil[0], conseil[1]);
+    console.log("   Émission de 550 UCM avec 2 signatures sur 3 : ACCEPTÉE");
+
+    await run(
+      new TransferTransaction()
+        .addTokenTransfer(ucmId, MY_ACCOUNT_ID, -u(550))
+        .addTokenTransfer(ucmId, FONDS.id, u(200))
+        .addTokenTransfer(ucmId, MA.id, u(200))
+        .addTokenTransfer(ucmId, IV.id, u(100))
+        .addTokenTransfer(ucmId, NG.id, u(50))
+    );
+    console.log("   Distribution : Fonds 200, Phosmar 200, Ivoire 100, Delta 50 UCM");
+
+    const { rcpt: rL } = await run(
+      new TokenCreateTransaction()
+        .setTokenName("Lots Solution Hedera (demo)")
+        .setTokenSymbol("LOT")
+        .setTokenType(TokenType.NonFungibleUnique)
+        .setSupplyType(TokenSupplyType.Finite)
+        .setMaxSupply(100)
+        .setInitialSupply(0)
+        .setTreasuryAccountId(MY_ACCOUNT_ID)
+        .setSupplyKey(MY_PRIVATE_KEY)
+    );
+    const lotId = rL.tokenId;
+    const { rcpt: rM } = await run(
+      new TokenMintTransaction().setTokenId(lotId).setMetadata([
+        Buffer.from("LOT1 gage: stock feves CI 2000 t"),
+        Buffer.from("LOT2 liqueur cacao CI 500 t"),
+        Buffer.from("LOT3 engrais NPK MA 1200 t"),
+      ])
+    );
+    const [s1, s2, s3] = rM.serials.map((s) => s.toNumber());
+    await run(
+      new TransferTransaction()
+        .addNftTransfer(new NftId(lotId, s1), MY_ACCOUNT_ID, IV.id)
+        .addNftTransfer(new NftId(lotId, s2), MY_ACCOUNT_ID, IV.id)
+        .addNftTransfer(new NftId(lotId, s3), MY_ACCOUNT_ID, MA.id)
+    );
+    console.log(`   LOT (NFT) : ${lotId}  #${s1} gage et #${s2} liqueur -> Ivoire, #${s3} engrais -> Phosmar\n`);
+
+    // ---------- 4. ACHAT GROUPÉ : offres scellées (commit-reveal) ----------
+    console.log("4) Achat groupé d'engrais (CI + SN + BF) : offres scellées sur HCS");
+    const offres = [
+      { fournisseur: "Fournisseur A (fictif)", prix: 412 },
+      { fournisseur: "Fournisseur B (fictif)", prix: 398 },
+    ];
+    for (const o of offres) {
+      o.sel = crypto.randomBytes(8).toString("hex");
+      o.hash = crypto.createHash("sha256").update(`${o.fournisseur}|${o.prix}|${o.sel}`).digest("hex");
+      const n = await journal({ type: "COMMIT", appel: "ENGRAIS-2026", hash: o.hash });
+      console.log(`   COMMIT ${o.fournisseur} : empreinte ${o.hash.slice(0, 16)}… (message n°${n})`);
+    }
+    for (const o of offres) {
+      const ok = crypto.createHash("sha256").update(`${o.fournisseur}|${o.prix}|${o.sel}`).digest("hex") === o.hash;
+      await journal({ type: "REVEAL", appel: "ENGRAIS-2026", fournisseur: o.fournisseur, prix: o.prix, sel: o.sel });
+      console.log(`   REVEAL ${o.fournisseur} : ${o.prix} $/t, empreinte ${ok ? "conforme" : "NON conforme"}`);
+    }
+    const gagnant = offres.reduce((a, b) => (a.prix <= b.prix ? a : b));
+    await journal({ type: "ATTRIBUTION", appel: "ENGRAIS-2026", gagnant: gagnant.fournisseur, prix: gagnant.prix });
+    console.log(`   Attribution : ${gagnant.fournisseur} à ${gagnant.prix} $/t (ordre et heure prouvés par le consensus)\n`);
+
+    // ---------- 5. PRÉFINANCEMENT : gage NFT, paiement direct à la coop ----------
+    console.log("5) Préfinancement de la récolte");
+    const { txId: tP } = await run(
+      new TransferTransaction()
+        .addTokenTransfer(ucmId, FONDS.id, -u(105))
+        .addTokenTransfer(ucmId, COOP.id, u(105))
+        .addNftTransfer(new NftId(lotId, s1), IV.id, FONDS.id),
+      FONDS.key, IV.key
+    );
+    await journal({ type: "PRET", preteur: "Fonds", emprunteur: "Ivoire Broyage", beneficiaire: "Coop", montant: 105, du: 109.1, gage: `LOT#${s1}` });
+    console.log(`   En UNE transaction : Fonds -> Coop 105 UCM ET gage LOT#${s1} Ivoire -> Fonds`);
+    console.log(`   Dette enregistrée : 109,1 UCM (8 %, 6 mois)  ${txLink(tP)}\n`);
+
+    // ---------- 6. ATTESTATIONS ----------
+    console.log("6) Production et attestations (HCS)");
+    for (const a of [
+      { type: "ATTESTATION", lot: `LOT#${s2}`, par: "Inspecteur qualite (fictif)", resultat: "conforme" },
+      { type: "ATTESTATION", lot: `LOT#${s2}`, par: "Douane CI (fictive)", resultat: "export autorise" },
+      { type: "ATTESTATION", lot: `LOT#${s3}`, par: "Labo sols MA (fictif)", resultat: "NPK conforme" },
+    ]) console.log(`   ${a.par} -> ${a.lot} : ${a.resultat} (message n°${await journal(a)})`);
+    console.log("");
+
+    // ---------- 7. TROC PROGRAMMÉ : liqueur contre engrais ----------
+    console.log("7) Troc programmé : LOT liqueur <-> LOT engrais");
+    const troc = new TransferTransaction()
+      .addNftTransfer(new NftId(lotId, s2), IV.id, MA.id)
+      .addNftTransfer(new NftId(lotId, s3), MA.id, IV.id);
+    const { rcpt: rS } = await run(
+      new ScheduleCreateTransaction().setScheduledTransaction(troc).setScheduleMemo("Troc Solution Hedera fictif"),
+      MA.key // Phosmar signe en premier
+    );
+    const scheduleId = rS.scheduleId;
+    let info = await new ScheduleInfoQuery().setScheduleId(scheduleId).execute(client);
+    console.log(`   Programmée ${scheduleId}, signée par Phosmar. Exécutée ? ${info.executed ? "oui" : "NON (attend Ivoire)"}`);
+    await run(new ScheduleSignTransaction().setScheduleId(scheduleId), IV.key);
+    info = await new ScheduleInfoQuery().setScheduleId(scheduleId).execute(client);
+    console.log(`   Ivoire signe -> exécutée ? ${info.executed ? "OUI : les deux lots ont changé de mains en même temps" : "non"}`);
+    console.log(`   ${HS}/schedule/${scheduleId}\n`);
+
+    // ---------- 8. COMPENSATION : seul le solde net circule ----------
+    console.log("8) Compensation multilatérale (factures du cycle, montants en UCM)");
+    const factures = [
+      { de: "Ivoire", a: "Phosmar", objet: "liqueur hors troc", montant: 78.3 }, // Phosmar doit à Ivoire
+      { de: "Delta", a: "Ivoire", objet: "produits chimiques", montant: 25 },    // Ivoire doit à Delta
+      { de: "Delta", a: "Phosmar", objet: "ammoniac", montant: 40 },            // Phosmar doit à Delta
+      { de: "Fonds", a: "Ivoire", objet: "remboursement pret", montant: 109.1 }, // Ivoire doit au Fonds
+    ];
+    const solde = { Ivoire: 0, Phosmar: 0, Delta: 0, Fonds: 0 };
+    let brut = 0;
+    for (const f of factures) {
+      solde[f.de] += f.montant; solde[f.a] -= f.montant; brut += f.montant;
+      await journal({ type: "FACTURE", vendeur: f.de, acheteur: f.a, objet: f.objet, montant: f.montant });
+      console.log(`   Facture ${f.de} -> ${f.a} (${f.objet}) : ${f.montant}`);
+    }
+    const net = Object.values(solde).filter((v) => v > 0).reduce((a, b) => a + b, 0);
+    for (const k in solde) console.log(`   Solde ${k.padEnd(8)} : ${solde[k] >= 0 ? "+" : ""}${solde[k].toFixed(1)}`);
+    console.log(`   Brut ${brut.toFixed(1)} -> à régler réellement ${net.toFixed(1)} (−${(100 * (1 - net / brut)).toFixed(0)} %)`);
+
+    const compte = { Ivoire: IV, Phosmar: MA, Delta: NG, Fonds: FONDS };
+    const reglement = new TransferTransaction();
+    const signataires = [];
+    for (const k in solde) {
+      if (Math.abs(solde[k]) < 0.05) continue;
+      reglement.addTokenTransfer(ucmId, compte[k].id, u(solde[k]));
+      if (solde[k] < 0) signataires.push(compte[k].key);
+    }
+    reglement.addNftTransfer(new NftId(lotId, s1), FONDS.id, IV.id); // le prêt est remboursé : gage rendu
+    signataires.push(FONDS.key);
+    const { txId: tR } = await run(reglement, ...signataires);
+    await journal({ type: "REGLEMENT", brut, net, soldes: solde, gage_rendu: `LOT#${s1}` });
+    console.log(`   Règlement ATOMIQUE (tout ou rien) + gage LOT#${s1} rendu à Ivoire  ${txLink(tR)}\n`);
+
+    // ---------- 9. AUDIT : nœud miroir ----------
+    console.log("9) Audit public (nœud miroir) — quelques secondes de délai");
+    await new Promise((r) => setTimeout(r, 6000));
+    try {
+      const res = await fetch(`https://testnet.mirrornode.hedera.com/api/v1/topics/${topicId}/messages?limit=25`);
+      const data = await res.json();
+      for (const m of data.messages || []) {
+        const txt = Buffer.from(m.message, "base64").toString();
+        console.log(`   n°${String(m.sequence_number).padStart(2)} ${m.consensus_timestamp}  ${txt.slice(0, 70)}`);
+      }
+    } catch (e) {
+      console.log(`   (lecture du miroir impossible ici : ouvrez ${HS}/topic/${topicId})`);
+    }
+    console.log("\n=== Fin : tout est visible et vérifiable sur HashScan ===");
+  } catch (error) {
+    console.error("Erreur :", error.status ? error.status.toString() : error.message);
+  } finally {
+    if (client) client.close();
+  }
+}
+
+main();
